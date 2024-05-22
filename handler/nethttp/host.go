@@ -39,6 +39,34 @@ func (host) SetMethod(ctx context.Context, method string) {
 	r.Method = method
 }
 
+func (host) SetNext(ctx context.Context, next uint64) {
+	requestStateFromContext(ctx).needNext = next
+}
+
+func (host) GetNext(ctx context.Context) uint64 {
+	return requestStateFromContext(ctx).needNext
+}
+
+func (host) GetCallback(ctx context.Context) uint64 {
+	state := requestStateFromContext(ctx)
+	if state == nil {
+		return 0
+	}
+	return state.callback
+}
+
+func (host) SetCallback(ctx context.Context, callback uint64) {
+	requestStateFromContext(ctx).callback = callback
+}
+
+func (host) GetArg(ctx context.Context, i uint32) uint32 {
+	return requestStateFromContext(ctx).args[i]
+}
+
+func (host) SetArgs(ctx context.Context, args ...uint32) {
+	requestStateFromContext(ctx).args = args
+}
+
 // GetURI implements the same method as documented on handler.Host.
 func (host) GetURI(ctx context.Context) string {
 	r := requestStateFromContext(ctx).r

@@ -5,11 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/stealthrocket/wasi-go"
+	importswazergo "github.com/stealthrocket/wasi-go/imports"
 	"github.com/tetratelabs/wazero"
 	wazeroapi "github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -57,6 +60,8 @@ type middleware struct {
 	pool            sync.Pool
 	features        handler.Features
 	instanceCounter uint64
+	noExport        bool
+	wazergo         bool
 }
 
 func (m *middleware) Features() handler.Features {
@@ -91,20 +96,32 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 		return nil, err
 	}
 
-	// Detect and handle any host imports or lack thereof.
-	imports := detectImports(m.guestModule.ImportedFunctions())
+	// Detect and handle any host detectedImports or lack thereof.
+	detectedImports := detectImports(m.guestModule.ImportedFunctions())
 	switch {
-	case imports&importWasiP1 != 0:
-		if _, err = wasi_snapshot_preview1.Instantiate(ctx, m.runtime); err != nil {
-			_ = wr.Close(ctx)
-			return nil, fmt.Errorf("wasm: error instantiating wasi: %w", err)
+	case detectedImports&importWasiP1 != 0:
+		extension := importswazergo.DetectSocketsExtension(m.guestModule)
+		if extension == nil {
+			wasi_snapshot_preview1.Instantiate(ctx, m.runtime)
+		} else {
+			m.wazergo = true
 		}
-		fallthrough // proceed to configure any http_handler imports
-	case imports&importHttpHandler != 0:
+		ctx = m.build(ctx)
+
+		fallthrough // proceed to configure any http_handler detectedImports
+	case detectedImports&importHttpHandler != 0:
 		if _, err = m.instantiateHost(ctx); err != nil {
 			_ = wr.Close(ctx)
 			return nil, fmt.Errorf("wasm: error instantiating host: %w", err)
 		}
+		fallthrough // proceed to configure no export detectedImports
+	case detectedImports&importWithNoExport != 0:
+		m.noExport = true
+	}
+
+	err = m.verifyExported()
+	if err != nil {
+		return nil, err
 	}
 
 	// Eagerly add one instance to the pool. Doing so helps to fail fast.
@@ -121,19 +138,24 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 func (m *middleware) compileGuest(ctx context.Context, wasm []byte) (wazero.CompiledModule, error) {
 	if guest, err := m.runtime.CompileModule(ctx, wasm); err != nil {
 		return nil, fmt.Errorf("wasm: error compiling guest: %w", err)
-	} else if handleRequest, ok := guest.ExportedFunctions()[handler.FuncHandleRequest]; !ok {
-		return nil, fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleRequest)
-	} else if len(handleRequest.ParamTypes()) != 0 || !bytes.Equal(handleRequest.ResultTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI64}) {
-		return nil, fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be () -> (i64)", handler.FuncHandleRequest)
-	} else if handleResponse, ok := guest.ExportedFunctions()[handler.FuncHandleResponse]; !ok {
-		return nil, fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleResponse)
-	} else if !bytes.Equal(handleResponse.ParamTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI32, wazeroapi.ValueTypeI32}) || len(handleResponse.ResultTypes()) != 0 {
-		return nil, fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be (i32, 32) -> ()", handler.FuncHandleResponse)
-	} else if _, ok = guest.ExportedMemories()[api.Memory]; !ok {
+	} else if _, ok := guest.ExportedMemories()[api.Memory]; !ok {
 		return nil, fmt.Errorf("wasm: guest doesn't export memory[%s]", api.Memory)
 	} else {
 		return guest, nil
 	}
+}
+
+func (m *middleware) verifyExported() error {
+	if handleRequest, ok := m.guestModule.ExportedFunctions()[handler.FuncHandleRequest]; !ok && !m.noExport {
+		return fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleRequest)
+	} else if !m.noExport && (len(handleRequest.ParamTypes()) != 0 || !bytes.Equal(handleRequest.ResultTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI64})) {
+		return fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be () -> (i64)", handler.FuncHandleRequest)
+	} else if handleResponse, ok := m.guestModule.ExportedFunctions()[handler.FuncHandleResponse]; !ok && !m.noExport {
+		return fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleResponse)
+	} else if !m.noExport && (!bytes.Equal(handleResponse.ParamTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI32, wazeroapi.ValueTypeI32}) || len(handleResponse.ResultTypes()) != 0) {
+		return fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be (i32, 32) -> ()", handler.FuncHandleResponse)
+	}
+	return nil
 }
 
 // HandleRequest implements Middleware.HandleRequest
@@ -158,6 +180,14 @@ func (m *middleware) HandleRequest(ctx context.Context) (outCtx context.Context,
 	}()
 
 	outCtx = context.WithValue(ctx, requestStateKey{}, s)
+	m.host.SetCallback(outCtx, 1)
+	outCtx = m.build(outCtx)
+
+	if g.handleRequestFn == nil {
+		_, err = m.runtime.InstantiateModule(outCtx, m.guestModule, m.moduleConfig)
+		ctxNext = handler.CtxNext(m.getNext(outCtx))
+		return
+	}
 	ctxNext, err = g.handleRequest(outCtx)
 	return
 }
@@ -179,7 +209,19 @@ func (m *middleware) HandleResponse(ctx context.Context, reqCtx uint32, hostErr 
 	s := requestStateFromContext(ctx)
 	defer s.Close()
 	s.afterNext = true
+	if s.g.handleRequestFn == nil {
+		wasError := uint64(0)
+		if hostErr != nil {
+			wasError = 1
+		}
 
+		ctx = m.build(ctx)
+
+		m.host.SetCallback(ctx, 2)
+		m.host.SetArgs(ctx, reqCtx, uint32(wasError))
+		_, err := m.runtime.InstantiateModule(ctx, m.guestModule, m.moduleConfig)
+		return err
+	}
 	return s.g.handleResponse(ctx, reqCtx, hostErr)
 }
 
@@ -197,6 +239,8 @@ type guest struct {
 
 func (m *middleware) newGuest(ctx context.Context) (*guest, error) {
 	moduleName := fmt.Sprintf("%d", atomic.AddUint64(&m.instanceCounter, 1))
+
+	ctx = m.build(ctx)
 
 	g, err := m.runtime.InstantiateModule(ctx, m.guestModule, m.moduleConfig.WithName(moduleName))
 	if err != nil {
@@ -605,6 +649,26 @@ func (m *middleware) setStatusCode(ctx context.Context, params []uint64) {
 	m.host.SetStatusCode(ctx, statusCode)
 }
 
+func (m *middleware) setNext(ctx context.Context, params []uint64) {
+	next := params[0]
+
+	_ = mustBeforeNext(ctx, "set", "next")
+
+	m.host.SetNext(ctx, next)
+}
+
+func (m *middleware) getCallback(ctx context.Context, params []uint64) {
+	params[0] = m.host.GetCallback(ctx)
+}
+func (m *middleware) getArg(ctx context.Context, params []uint64) {
+	params[0] = uint64(m.host.GetArg(ctx, uint32(params[0])))
+
+}
+
+func (m *middleware) getNext(ctx context.Context) uint64 {
+	return m.host.GetNext(ctx)
+}
+
 func readBody(mod wazeroapi.Module, buf uint32, bufLimit handler.BufLimit, r io.Reader) (eofLen uint64) {
 	// buf_limit 0 serves no purpose as implementations won't return EOF on it.
 	if bufLimit == 0 {
@@ -713,7 +777,35 @@ func (m *middleware) instantiateHost(ctx context.Context) (wazeroapi.Module, err
 		NewFunctionBuilder().
 		WithGoFunction(wazeroapi.GoFunc(m.setStatusCode), []wazeroapi.ValueType{i32}, []wazeroapi.ValueType{}).
 		WithParameterNames("status_code").Export(handler.FuncSetStatusCode).
+		NewFunctionBuilder().
+		WithGoFunction(wazeroapi.GoFunc(m.setNext), []wazeroapi.ValueType{i64}, []wazeroapi.ValueType{}).
+		WithParameterNames("next").Export("set_next").
+		NewFunctionBuilder().
+		WithGoFunction(wazeroapi.GoFunc(m.getCallback), []wazeroapi.ValueType{}, []wazeroapi.ValueType{i64}).
+		WithParameterNames("next").Export("get_callback").
+		NewFunctionBuilder().
+		WithGoFunction(wazeroapi.GoFunc(m.getArg), []wazeroapi.ValueType{i32}, []wazeroapi.ValueType{i32}).
+		WithParameterNames("next").Export("get_arg").
 		Instantiate(ctx)
+}
+
+func (m *middleware) build(outCtx context.Context) context.Context {
+	if !m.wazergo {
+		return outCtx
+	}
+	builder := importswazergo.NewBuilder().WithSocketsExtension("auto", m.guestModule)
+	var err error
+	var sys wasi.System
+	outCtx, sys, err = builder.Instantiate(outCtx, m.runtime)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_ = sys
+	// TODO Return cleanup1
+	// defer sys.Close(outCtx)
+
+	return outCtx
 }
 
 func mustHeaderMutable(ctx context.Context, op string, kind handler.HeaderKind) {
@@ -780,17 +872,23 @@ type imports uint
 const (
 	importWasiP1 imports = 1 << iota
 	importHttpHandler
+	importWithNoExport
 )
 
 func detectImports(importedFns []wazeroapi.FunctionDefinition) (imports imports) {
 	for _, f := range importedFns {
-		moduleName, _, _ := f.Import()
+		moduleName, name, _ := f.Import()
 		switch moduleName {
 		case handler.HostModule:
 			imports |= importHttpHandler
 		case wasi_snapshot_preview1.ModuleName:
 			imports |= importWasiP1
 		}
+
+		if name == "get_callback" {
+			imports |= importWithNoExport
+		}
 	}
+
 	return
 }

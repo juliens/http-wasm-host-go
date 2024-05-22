@@ -35,6 +35,9 @@ type requestState struct {
 	w        http.ResponseWriter
 	r        *http.Request
 	next     http.Handler
+	needNext uint64
+	callback uint64
+	args     []uint32
 	features handlerapi.Features
 }
 
@@ -82,7 +85,11 @@ func (s *requestState) handleNext() (err error) {
 }
 
 func requestStateFromContext(ctx context.Context) *requestState {
-	return ctx.Value(requestStateKey{}).(*requestState)
+	val := ctx.Value(requestStateKey{})
+	if val == nil {
+		return nil
+	}
+	return val.(*requestState)
 }
 
 // NewHandler implements the same method as documented on handler.Middleware.

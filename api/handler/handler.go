@@ -107,6 +107,13 @@ type Host interface {
 	// FuncSetStatusCode.
 	SetStatusCode(ctx context.Context, statusCode uint32)
 
+	SetNext(ctx context.Context, next uint64)
+	GetNext(ctx context.Context) uint64
+	GetCallback(ctx context.Context) uint64
+	GetArg(ctx context.Context, i uint32) uint32
+	SetArgs(ctx context.Context, val ...uint32)
+	SetCallback(ctx context.Context, callback uint64)
+
 	// GetResponseHeaderNames supports the WebAssembly function export
 	// FuncGetHeaderNames with HeaderKindResponse. This returns nil if no
 	// headers exist.
@@ -210,3 +217,9 @@ func (UnimplementedHost) SetResponseTrailerValue(context.Context, string, string
 func (UnimplementedHost) AddResponseTrailerValue(context.Context, string, string)            {}
 func (UnimplementedHost) RemoveResponseTrailer(context.Context, string)                      {}
 func (UnimplementedHost) GetSourceAddr(context.Context) string                               { return "1.1.1.1:12345" }
+func (UnimplementedHost) SetNext(context.Context, uint64)                                    { return }
+func (UnimplementedHost) GetNext(context.Context) uint64                                     { return 20 }
+func (UnimplementedHost) GetCallback(context.Context) uint64                                 { return 20 }
+func (UnimplementedHost) SetCallback(context.Context, uint64)                                { return }
+func (UnimplementedHost) GetArg(context.Context, uint32) uint32                              { return 32 }
+func (UnimplementedHost) SetArgs(context.Context, ...uint32)                                 {}
