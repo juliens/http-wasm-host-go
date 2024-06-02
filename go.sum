@@ -1,2 +1,4 @@
-github.com/tetratelabs/wazero v1.5.0 h1:Yz3fZHivfDiZFUXnWMPUoiW7s8tC1sjdBtlJn08qYa0=
-github.com/tetratelabs/wazero v1.5.0/go.mod h1:0U0G41+ochRKoPKCJlh0jMg1CHkyfK8kDqiirMmKY8A=
+github.com/juliens/wasm-goexport v0.0.4 h1:Kj2xaRSE7x73d/AjJ3moBgMS9kI6TgqOL4QS6WmWym4=
+github.com/juliens/wasm-goexport v0.0.4/go.mod h1:9Csd4i5itjBZ/yQdNFOJuVWlAWjyAgyBBZ4YlcWK+oM=
+github.com/tetratelabs/wazero v1.7.2 h1:1+z5nXJNwMLPAWaTePFi49SSTL0IMx/i3Fg8Yc25GDc=
+github.com/tetratelabs/wazero v1.7.2/go.mod h1:ytl6Zuh20R/eROuyDaGPkp82O9C/DJfXAwJfQ3X6/7Y=

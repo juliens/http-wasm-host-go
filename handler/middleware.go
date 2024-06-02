@@ -10,12 +10,12 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/http-wasm/http-wasm-host-go/api"
+	"github.com/http-wasm/http-wasm-host-go/api/handler"
+	exporthost "github.com/juliens/wasm-goexport/host"
 	"github.com/tetratelabs/wazero"
 	wazeroapi "github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
-
-	"github.com/http-wasm/http-wasm-host-go/api"
-	"github.com/http-wasm/http-wasm-host-go/api/handler"
 )
 
 // Middleware implements the http-wasm handler ABI.
@@ -57,6 +57,7 @@ type middleware struct {
 	pool            sync.Pool
 	features        handler.Features
 	instanceCounter uint64
+	exporter        *exporthost.Exporter
 }
 
 func (m *middleware) Features() handler.Features {
@@ -107,11 +108,22 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 		}
 	}
 
+	if exporthost.DetectGoExports(m.guestModule) {
+		m.exporter = exporthost.NewExporter(wr)
+		err := m.exporter.BuildHost(ctx, m.guestModule)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Eagerly add one instance to the pool. Doing so helps to fail fast.
 	if g, err := m.newGuest(ctx); err != nil {
 		_ = wr.Close(ctx)
 		return nil, err
 	} else {
+		if err := verifyExportFunc(g.guest.ExportedFunctionDefinitions()); err != nil {
+			return nil, err
+		}
 		m.pool.Put(g)
 	}
 
@@ -119,21 +131,33 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 }
 
 func (m *middleware) compileGuest(ctx context.Context, wasm []byte) (wazero.CompiledModule, error) {
-	if guest, err := m.runtime.CompileModule(ctx, wasm); err != nil {
+	guest, err := m.runtime.CompileModule(ctx, wasm)
+	if err != nil {
 		return nil, fmt.Errorf("wasm: error compiling guest: %w", err)
-	} else if handleRequest, ok := guest.ExportedFunctions()[handler.FuncHandleRequest]; !ok {
-		return nil, fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleRequest)
-	} else if len(handleRequest.ParamTypes()) != 0 || !bytes.Equal(handleRequest.ResultTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI64}) {
-		return nil, fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be () -> (i64)", handler.FuncHandleRequest)
-	} else if handleResponse, ok := guest.ExportedFunctions()[handler.FuncHandleResponse]; !ok {
-		return nil, fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleResponse)
-	} else if !bytes.Equal(handleResponse.ParamTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI32, wazeroapi.ValueTypeI32}) || len(handleResponse.ResultTypes()) != 0 {
-		return nil, fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be (i32, 32) -> ()", handler.FuncHandleResponse)
-	} else if _, ok = guest.ExportedMemories()[api.Memory]; !ok {
+	} else if _, ok := guest.ExportedMemories()[api.Memory]; !ok {
 		return nil, fmt.Errorf("wasm: guest doesn't export memory[%s]", api.Memory)
-	} else {
-		return guest, nil
 	}
+
+	if !exporthost.DetectGoExports(guest) {
+		if err := verifyExportFunc(guest.ExportedFunctions()); err != nil {
+			return nil, err
+		}
+	}
+
+	return guest, nil
+}
+
+func verifyExportFunc(exportedFunctions map[string]wazeroapi.FunctionDefinition) error {
+	if handleRequest, ok := exportedFunctions[handler.FuncHandleRequest]; !ok {
+		return fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleRequest)
+	} else if len(handleRequest.ParamTypes()) != 0 || !bytes.Equal(handleRequest.ResultTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI64}) {
+		return fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be () -> (i64)", handler.FuncHandleRequest)
+	} else if handleResponse, ok := exportedFunctions[handler.FuncHandleResponse]; !ok {
+		return fmt.Errorf("wasm: guest doesn't export func[%s]", handler.FuncHandleResponse)
+	} else if !bytes.Equal(handleResponse.ParamTypes(), []wazeroapi.ValueType{wazeroapi.ValueTypeI32, wazeroapi.ValueTypeI32}) || len(handleResponse.ResultTypes()) != 0 {
+		return fmt.Errorf("wasm: guest exports the wrong signature for func[%s]. should be (i32, 32) -> ()", handler.FuncHandleResponse)
+	}
+	return nil
 }
 
 // HandleRequest implements Middleware.HandleRequest
@@ -198,7 +222,14 @@ type guest struct {
 func (m *middleware) newGuest(ctx context.Context) (*guest, error) {
 	moduleName := fmt.Sprintf("%d", atomic.AddUint64(&m.instanceCounter, 1))
 
-	g, err := m.runtime.InstantiateModule(ctx, m.guestModule, m.moduleConfig.WithName(moduleName))
+	var g wazeroapi.Module
+	var err error
+	if exporthost.DetectGoExports(m.guestModule) {
+		g, err = m.exporter.InstantiateModule(ctx, m.guestModule, m.moduleConfig.WithName(moduleName))
+
+	} else {
+		g, err = m.runtime.InstantiateModule(ctx, m.guestModule, m.moduleConfig.WithName(moduleName))
+	}
 	if err != nil {
 		_ = m.runtime.Close(ctx)
 		return nil, fmt.Errorf("wasm: error instantiating guest: %w", err)

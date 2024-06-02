@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/http-wasm/http-wasm-host-go/api/handler"
+	"github.com/juliens/wasm-goexport/host"
 )
 
 // requestStateKey is a context.Context value associated with a requestState
@@ -13,6 +14,7 @@ import (
 type requestStateKey struct{}
 
 func requestStateFromContext(ctx context.Context) *requestState {
+	ctx = host.GetRealCtx(ctx)
 	return ctx.Value(requestStateKey{}).(*requestState)
 }
 

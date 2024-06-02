@@ -8,6 +8,7 @@ import (
 
 	handlerapi "github.com/http-wasm/http-wasm-host-go/api/handler"
 	"github.com/http-wasm/http-wasm-host-go/handler"
+	exporterhost "github.com/juliens/wasm-goexport/host"
 )
 
 // compile-time checks to ensure interfaces are implemented.
@@ -82,6 +83,7 @@ func (s *requestState) handleNext() (err error) {
 }
 
 func requestStateFromContext(ctx context.Context) *requestState {
+	ctx = exporterhost.GetRealCtx(ctx)
 	return ctx.Value(requestStateKey{}).(*requestState)
 }
 
