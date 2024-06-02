@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"github.com/http-wasm/http-wasm-host-go/api"
 	"github.com/http-wasm/http-wasm-host-go/api/handler"
 	exporthost "github.com/juliens/wasm-goexport/host"
+	"github.com/stealthrocket/wasi-go"
+	importswazergo "github.com/stealthrocket/wasi-go/imports"
 	"github.com/tetratelabs/wazero"
 	wazeroapi "github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -58,6 +61,7 @@ type middleware struct {
 	features        handler.Features
 	instanceCounter uint64
 	exporter        *exporthost.Exporter
+	wazergo         bool
 }
 
 func (m *middleware) Features() handler.Features {
@@ -96,10 +100,16 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 	imports := detectImports(m.guestModule.ImportedFunctions())
 	switch {
 	case imports&importWasiP1 != 0:
-		if _, err = wasi_snapshot_preview1.Instantiate(ctx, m.runtime); err != nil {
-			_ = wr.Close(ctx)
-			return nil, fmt.Errorf("wasm: error instantiating wasi: %w", err)
+		extension := importswazergo.DetectSocketsExtension(m.guestModule)
+		if extension == nil {
+			if _, err = wasi_snapshot_preview1.Instantiate(ctx, m.runtime); err != nil {
+				_ = wr.Close(ctx)
+				return nil, fmt.Errorf("wasm: error instantiating wasi: %w", err)
+			}
+		} else {
+			m.wazergo = true
 		}
+
 		fallthrough // proceed to configure any http_handler imports
 	case imports&importHttpHandler != 0:
 		if _, err = m.instantiateHost(ctx); err != nil {
@@ -128,6 +138,25 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 	}
 
 	return m, nil
+}
+
+func (m *middleware) build(outCtx context.Context) context.Context {
+	if !m.wazergo {
+		return outCtx
+	}
+	builder := importswazergo.NewBuilder().WithSocketsExtension("auto", m.guestModule)
+	var err error
+	var sys wasi.System
+	outCtx, sys, err = builder.Instantiate(outCtx, m.runtime)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_ = sys
+	// TODO Return cleanup1
+	// defer sys.Close(outCtx)
+
+	return outCtx
 }
 
 func (m *middleware) compileGuest(ctx context.Context, wasm []byte) (wazero.CompiledModule, error) {
@@ -221,6 +250,8 @@ type guest struct {
 
 func (m *middleware) newGuest(ctx context.Context) (*guest, error) {
 	moduleName := fmt.Sprintf("%d", atomic.AddUint64(&m.instanceCounter, 1))
+
+	ctx = m.build(ctx)
 
 	var g wazeroapi.Module
 	var err error
