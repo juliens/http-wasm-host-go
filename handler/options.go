@@ -36,6 +36,12 @@ func ModuleConfig(moduleConfig wazero.ModuleConfig) Option {
 	}
 }
 
+func WithDirs(dirs ...string) Option {
+	return func(h *options) {
+		h.dirs = dirs
+	}
+}
+
 // Logger sets the logger used by the guest when it calls "log". Defaults to
 // api.NoopLogger.
 func Logger(logger api.Logger) Option {
@@ -49,6 +55,7 @@ type options struct {
 	guestConfig  []byte
 	moduleConfig wazero.ModuleConfig
 	logger       api.Logger
+	dirs         []string
 }
 
 // DefaultRuntime implements options.newRuntime.

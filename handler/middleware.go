@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +63,7 @@ type middleware struct {
 	instanceCounter uint64
 	exporter        *exporthost.Exporter
 	wazergo         bool
+	dirs            []string
 }
 
 func (m *middleware) Features() handler.Features {
@@ -89,6 +91,7 @@ func NewMiddleware(ctx context.Context, guest []byte, host handler.Host, opts ..
 		moduleConfig: o.moduleConfig,
 		guestConfig:  o.guestConfig,
 		logger:       o.logger,
+		dirs:         o.dirs,
 	}
 
 	if m.guestModule, err = m.compileGuest(ctx, guest); err != nil {
@@ -145,6 +148,9 @@ func (m *middleware) build(outCtx context.Context) context.Context {
 		return outCtx
 	}
 	builder := importswazergo.NewBuilder().WithSocketsExtension("auto", m.guestModule)
+	if len(m.dirs) > 0 {
+		builder.WithDirs(m.dirs...)
+	}
 	var err error
 	var sys wasi.System
 	outCtx, sys, err = builder.Instantiate(outCtx, m.runtime)
@@ -253,11 +259,14 @@ func (m *middleware) newGuest(ctx context.Context) (*guest, error) {
 
 	ctx = m.build(ctx)
 
+	for _, dir := range m.dirs {
+		m.moduleConfig.WithFS(os.DirFS(dir))
+	}
+
 	var g wazeroapi.Module
 	var err error
 	if exporthost.DetectGoExports(m.guestModule) {
 		g, err = m.exporter.InstantiateModule(ctx, m.guestModule, m.moduleConfig.WithName(moduleName))
-
 	} else {
 		g, err = m.runtime.InstantiateModule(ctx, m.guestModule, m.moduleConfig.WithName(moduleName))
 	}
